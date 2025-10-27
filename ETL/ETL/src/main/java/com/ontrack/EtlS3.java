@@ -16,8 +16,8 @@ import java.util.List;
 
 public class EtlS3 {
     public static void main(String[] args) {
-        String bucketRaw = "raw-ontrack"; // bucket de origem
-        String bucketProcessed = "trusted-ontrack"; // bucket destino
+        String bucketRaw = "s3-raw-ontracksystems"; // bucket de origem
+        String bucketProcessed = "s3-trusted-ontracksystems"; // bucket destino
         String caminhoRaw = "coletaGeralOTS.csv"; // arquivo no S3
         String localRaw = "temp/coletaGeralOTS.csv"; // caminho local temporário
         String localProcessed = "temp/coletaTratado.csv"; // arquivo tratado
