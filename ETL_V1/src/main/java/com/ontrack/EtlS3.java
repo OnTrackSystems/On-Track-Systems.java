@@ -1,9 +1,10 @@
 package com.ontrack;
 
+import com.amazonaws.services.lambda.runtime.Context;
+import com.amazonaws.services.lambda.runtime.RequestHandler;
 import com.opencsv.CSVReader;
 import com.opencsv.CSVWriter;
 import com.opencsv.exceptions.CsvException;
-import software.amazon.awssdk.auth.credentials.ProfileCredentialsProvider;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
@@ -18,18 +19,19 @@ import java.time.ZonedDateTime;
 import java.util.*;
 import java.util.stream.Collectors;
 
-public class EtlS3 {
+public class EtlS3 implements RequestHandler<Object, String> {
 
-    // Configurações
     private static final String BUCKET_RAW = "s3-raw-ontracksystems";
     private static final String BUCKET_TRUSTED = "s3-trusted-ontracksystems";
     private static final Region REGIAO = Region.US_EAST_1;
 
-    public static void main(String[] args) {
-        S3Client s3 = S3Client.builder()
-                .region(REGIAO)
-                .credentialsProvider(ProfileCredentialsProvider.create())
-                .build();
+    private static final S3Client s3 = S3Client.builder()
+            .region(REGIAO)
+            .build();
+
+    @Override
+    public String handleRequest(Object input, Context context) {
+        context.getLogger().log("Iniciando ETL...");
 
         try {
             ZoneId fusoBrasil = ZoneId.of("America/Sao_Paulo");
@@ -38,36 +40,37 @@ public class EtlS3 {
             String caminhoData = String.format("ano=%d/mes=%02d/dia=%02d/hora=%02d/",
                     alvo.getYear(), alvo.getMonthValue(), alvo.getDayOfMonth(), alvo.getHour());
 
-            System.out.println("-> Iniciando ETL para o período: " + caminhoData);
+            context.getLogger().log("-> Período alvo: " + caminhoData);
 
             List<String> garagens = listarGaragens(s3);
 
             for (String garagemPrefix : garagens) {
-                processarGaragem(s3, garagemPrefix, caminhoData);
+                processarGaragem(s3, garagemPrefix, caminhoData, context);
             }
 
-            System.out.println("ETL Global finalizada com sucesso!");
+            return "ETL Global finalizada com sucesso!";
 
         } catch (Exception e) {
-            e.printStackTrace();
-        } finally {
-            s3.close();
+            context.getLogger().log("ERRO FATAL: " + e.getMessage());
+            throw new RuntimeException(e);
         }
     }
 
-    private static void processarGaragem(S3Client s3, String garagemPrefix, String caminhoData) throws IOException, CsvException {
+    private void processarGaragem(S3Client s3, String garagemPrefix, String caminhoData, Context context) throws IOException, CsvException {
         String prefixoCompleto = garagemPrefix + caminhoData;
-        System.out.println("\nVerificando: " + prefixoCompleto);
 
         List<S3Object> arquivosS3 = listarArquivosDoPrefixo(s3, prefixoCompleto);
 
         if (arquivosS3.isEmpty()) {
-            System.out.println("   [!] Nenhum dado encontrado nesta hora para " + garagemPrefix);
+            System.out.println("   [!] Nenhum dado encontrado para " + garagemPrefix);
             return;
         }
 
-        Path tempDir = Paths.get("temp", garagemPrefix, caminhoData);
-        Files.createDirectories(tempDir);
+        Path tempDir = Paths.get("/tmp", garagemPrefix, caminhoData);
+
+        if (!Files.exists(tempDir)) {
+            Files.createDirectories(tempDir);
+        }
 
         List<Path> arquivosBaixados = new ArrayList<>();
 
@@ -87,20 +90,21 @@ public class EtlS3 {
         if (sucesso) {
             String chaveDestino = prefixoCompleto + nomeArquivoFinal;
             uploadParaS3(s3, BUCKET_TRUSTED, chaveDestino, pathArquivoFinal);
-            System.out.println("   [OK] Processamento concluído para " + garagemPrefix);
+            context.getLogger().log("   [OK] Uploaded: " + chaveDestino);
         }
+
+        limparTemp(tempDir);
     }
 
-    private static boolean consolidarETratar(List<Path> inputs, Path output) throws IOException, CsvException {
+    // ... (O método consolidarETratar mantém igual) ...
+    private boolean consolidarETratar(List<Path> inputs, Path output) throws IOException, CsvException {
         Set<String> timestampsVistos = new HashSet<>();
         boolean cabeçalhoEscrito = false;
 
         try (CSVWriter writer = new CSVWriter(new FileWriter(output.toFile()))) {
-
             for (Path inputPath : inputs) {
                 try (CSVReader reader = new CSVReader(new FileReader(inputPath.toFile()))) {
                     List<String[]> linhas = reader.readAll();
-
                     if (linhas.isEmpty()) continue;
 
                     int inicioLeitura = 0;
@@ -114,27 +118,20 @@ public class EtlS3 {
 
                     for (int i = inicioLeitura; i < linhas.size(); i++) {
                         String[] l = linhas.get(i);
-
                         if (l.length < 6) continue;
-
                         String timestamp = l[0];
-
                         try {
                             double cpu = Double.parseDouble(l[2]);
                             double ramPercent = Double.parseDouble(l[4]);
                             double disco = Double.parseDouble(l[5]);
-
                             if (cpu < 0 || cpu > 100) continue;
                             if (ramPercent < 0 || ramPercent > 100) continue;
                             if (disco < 0) continue;
-
                             if (!timestampsVistos.contains(timestamp)) {
                                 timestampsVistos.add(timestamp);
                                 writer.writeNext(l);
                             }
-
-                        } catch (NumberFormatException e) {
-                        }
+                        } catch (NumberFormatException e) {}
                     }
                 }
             }
@@ -142,19 +139,17 @@ public class EtlS3 {
         return true;
     }
 
-    private static List<String> listarGaragens(S3Client s3) {
+    private List<String> listarGaragens(S3Client s3) {
         ListObjectsV2Request request = ListObjectsV2Request.builder()
                 .bucket(BUCKET_RAW)
                 .delimiter("/")
                 .build();
-
-        ListObjectsV2Response response = s3.listObjectsV2(request);
-        return response.commonPrefixes().stream()
+        return s3.listObjectsV2(request).commonPrefixes().stream()
                 .map(CommonPrefix::prefix)
                 .collect(Collectors.toList());
     }
 
-    private static List<S3Object> listarArquivosDoPrefixo(S3Client s3, String prefixo) {
+    private List<S3Object> listarArquivosDoPrefixo(S3Client s3, String prefixo) {
         ListObjectsV2Request request = ListObjectsV2Request.builder()
                 .bucket(BUCKET_RAW)
                 .prefix(prefixo)
@@ -162,31 +157,28 @@ public class EtlS3 {
         return s3.listObjectsV2(request).contents();
     }
 
-    private static void downloadDoS3(S3Client s3, String key, Path destino) {
+    private void downloadDoS3(S3Client s3, String key, Path destino) {
         try {
-            // 1. Verifica se o arquivo já existe e deleta para evitar o erro FileAlreadyExistsException
             Files.deleteIfExists(destino);
-
-            GetObjectRequest getReq = GetObjectRequest.builder()
-                    .bucket(BUCKET_RAW)
-                    .key(key)
-                    .build();
-
-            // 2. Realiza o download
+            GetObjectRequest getReq = GetObjectRequest.builder().bucket(BUCKET_RAW).key(key).build();
             s3.getObject(getReq, destino);
-
         } catch (IOException e) {
-            System.err.println("Erro ao preparar local para arquivo: " + destino);
-            e.printStackTrace();
+            System.err.println("Erro download: " + e.getMessage());
         }
     }
 
-    private static void uploadParaS3(S3Client s3, String bucket, String key, Path localPath) {
-        PutObjectRequest putReq = PutObjectRequest.builder()
-                .bucket(bucket)
-                .key(key)
-                .build();
+    private void uploadParaS3(S3Client s3, String bucket, String key, Path localPath) {
+        PutObjectRequest putReq = PutObjectRequest.builder().bucket(bucket).key(key).build();
         s3.putObject(putReq, RequestBody.fromFile(localPath));
-        System.out.println("   -> Uploaded: " + key);
+    }
+
+    private void limparTemp(Path path) {
+        try {
+            Files.walk(path)
+                    .sorted(Comparator.reverseOrder())
+                    .map(Path::toFile)
+                    .forEach(java.io.File::delete);
+        } catch (Exception e) {
+        }
     }
 }
