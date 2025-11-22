@@ -31,24 +31,21 @@ public class EtlS3 implements RequestHandler<Object, String> {
 
     @Override
     public String handleRequest(Object input, Context context) {
-        context.getLogger().log("Iniciando ETL...");
+        context.getLogger().log("Iniciando ETL Lambda...");
 
         try {
             ZoneId fusoBrasil = ZoneId.of("America/Sao_Paulo");
             ZonedDateTime alvo = ZonedDateTime.now(fusoBrasil).minusHours(1);
 
-            String caminhoData = String.format("ano=%d/mes=%02d/dia=%02d/hora=%02d/",
-                    alvo.getYear(), alvo.getMonthValue(), alvo.getDayOfMonth(), alvo.getHour());
-
-            context.getLogger().log("-> Período alvo: " + caminhoData);
+            context.getLogger().log("-> Processando referência: " + alvo);
 
             List<String> garagens = listarGaragens(s3);
 
             for (String garagemPrefix : garagens) {
-                processarGaragem(s3, garagemPrefix, caminhoData, context);
+                processarGaragem(s3, garagemPrefix, alvo, context);
             }
 
-            return "ETL Global finalizada com sucesso!";
+            return "Sucesso! Dados processados.";
 
         } catch (Exception e) {
             context.getLogger().log("ERRO FATAL: " + e.getMessage());
@@ -56,18 +53,21 @@ public class EtlS3 implements RequestHandler<Object, String> {
         }
     }
 
-    private void processarGaragem(S3Client s3, String garagemPrefix, String caminhoData, Context context) throws IOException, CsvException {
-        String prefixoCompleto = garagemPrefix + caminhoData;
+    private void processarGaragem(S3Client s3, String garagemPrefix, ZonedDateTime alvo, Context context) throws IOException, CsvException {
 
-        List<S3Object> arquivosS3 = listarArquivosDoPrefixo(s3, prefixoCompleto);
+        String caminhoLeituraRaw = String.format("ano=%d/mes=%02d/dia=%02d/hora=%02d/",
+                alvo.getYear(), alvo.getMonthValue(), alvo.getDayOfMonth(), alvo.getHour());
+
+        String prefixoCompletoRaw = garagemPrefix + caminhoLeituraRaw;
+
+        List<S3Object> arquivosS3 = listarArquivosDoPrefixo(s3, prefixoCompletoRaw);
 
         if (arquivosS3.isEmpty()) {
-            System.out.println("   [!] Nenhum dado encontrado para " + garagemPrefix);
+            System.out.println("   [!] " + garagemPrefix + ": Nada na hora " + alvo.getHour());
             return;
         }
 
-        Path tempDir = Paths.get("/tmp", garagemPrefix, caminhoData);
-
+        Path tempDir = Paths.get("/tmp", garagemPrefix, caminhoLeituraRaw);
         if (!Files.exists(tempDir)) {
             Files.createDirectories(tempDir);
         }
@@ -82,21 +82,26 @@ public class EtlS3 implements RequestHandler<Object, String> {
             arquivosBaixados.add(destinoLocal);
         }
 
-        String nomeArquivoFinal = "consolidado_" + System.currentTimeMillis() + ".csv";
+        String caminhoEscritaTrusted = String.format("ano=%d/mes=%02d/dia=%02d/",
+                alvo.getYear(), alvo.getMonthValue(), alvo.getDayOfMonth());
+
+        String nomeArquivoFinal = String.format("consolidado_%02d.csv", alvo.getHour());
+
         Path pathArquivoFinal = tempDir.resolve(nomeArquivoFinal);
 
         boolean sucesso = consolidarETratar(arquivosBaixados, pathArquivoFinal);
 
         if (sucesso) {
-            String chaveDestino = prefixoCompleto + nomeArquivoFinal;
+            String chaveDestino = garagemPrefix + caminhoEscritaTrusted + nomeArquivoFinal;
+
             uploadParaS3(s3, BUCKET_TRUSTED, chaveDestino, pathArquivoFinal);
-            context.getLogger().log("   [OK] Uploaded: " + chaveDestino);
+
+            context.getLogger().log("   [OK] Gerado: " + chaveDestino);
         }
 
         limparTemp(tempDir);
     }
 
-    // ... (O método consolidarETratar mantém igual) ...
     private boolean consolidarETratar(List<Path> inputs, Path output) throws IOException, CsvException {
         Set<String> timestampsVistos = new HashSet<>();
         boolean cabeçalhoEscrito = false;
@@ -108,6 +113,7 @@ public class EtlS3 implements RequestHandler<Object, String> {
                     if (linhas.isEmpty()) continue;
 
                     int inicioLeitura = 0;
+
                     if (!cabeçalhoEscrito) {
                         writer.writeNext(linhas.get(0));
                         cabeçalhoEscrito = true;
@@ -118,15 +124,19 @@ public class EtlS3 implements RequestHandler<Object, String> {
 
                     for (int i = inicioLeitura; i < linhas.size(); i++) {
                         String[] l = linhas.get(i);
+
                         if (l.length < 6) continue;
+
                         String timestamp = l[0];
                         try {
                             double cpu = Double.parseDouble(l[2]);
                             double ramPercent = Double.parseDouble(l[4]);
                             double disco = Double.parseDouble(l[5]);
+
                             if (cpu < 0 || cpu > 100) continue;
                             if (ramPercent < 0 || ramPercent > 100) continue;
                             if (disco < 0) continue;
+
                             if (!timestampsVistos.contains(timestamp)) {
                                 timestampsVistos.add(timestamp);
                                 writer.writeNext(l);
@@ -160,6 +170,7 @@ public class EtlS3 implements RequestHandler<Object, String> {
     private void downloadDoS3(S3Client s3, String key, Path destino) {
         try {
             Files.deleteIfExists(destino);
+
             GetObjectRequest getReq = GetObjectRequest.builder().bucket(BUCKET_RAW).key(key).build();
             s3.getObject(getReq, destino);
         } catch (IOException e) {
@@ -178,7 +189,6 @@ public class EtlS3 implements RequestHandler<Object, String> {
                     .sorted(Comparator.reverseOrder())
                     .map(Path::toFile)
                     .forEach(java.io.File::delete);
-        } catch (Exception e) {
-        }
+        } catch (Exception e) {}
     }
 }
