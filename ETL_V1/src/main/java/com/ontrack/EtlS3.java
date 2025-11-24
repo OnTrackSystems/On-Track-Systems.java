@@ -21,8 +21,8 @@ import java.util.stream.Collectors;
 
 public class EtlS3 implements RequestHandler<Object, String> {
 
-    private static final String BUCKET_RAW = "s3-raw-ontracksystems";
-    private static final String BUCKET_TRUSTED = "s3-trusted-ontracksystems";
+    private static final String BUCKET_RAW = System.getenv().getOrDefault("BUCKET_RAW", "s3-raw-ontracksystems");
+    private static final String BUCKET_TRUSTED = System.getenv().getOrDefault("BUCKET_TRUSTED", "s3-trusted-ontracksystems");
     private static final Region REGIAO = Region.US_EAST_1;
 
     private static final S3Client s3 = S3Client.builder()
